@@ -1,0 +1,197 @@
+---
+- name: Install K3s and AWX
+  hosts: awx_servers
+  become: true
+  vars:
+    awx_operator_version: "2.17.0"
+    awx_namespace: "awx"
+    bastion_install_dir: /root/awx
+  pre_tasks:
+    - name: Install required packages
+      ansible.builtin.yum:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - epel-release
+        - git
+        - make
+        - firewalld
+        - podman
+
+  tasks:
+    - name: Ensure firewalld is installed
+      ansible.builtin.yum:
+        name: firewalld
+        state: present
+
+    - name: Start and enable firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Ensure firewalld uses iptables instead of nftables
+      ansible.builtin.lineinfile:
+        path: /etc/firewalld/firewalld.conf
+        regexp: "^FirewallBackend"
+        line: "FirewallBackend=iptables"
+
+    - name: Restart firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: restarted
+
+    - name: Download k3s install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io/
+        dest: /root/k3s_install.sh
+        mode: '0755'
+
+    - name: Install k3s
+      ansible.builtin.command:
+        cmd: /root/k3s_install.sh --write-kubeconfig-mode 644 --selinux --kubelet-arg "container-log-max-files=4" --kubelet-arg "container-log-max-size=50Mi"
+        creates: /etc/rancher/k3s/k3s.yaml
+      environment:
+        INSTALL_K3S_BIN_DIR: /usr/bin
+
+    - name: Allow k3s to properly deploy default services, wait 3m
+      ansible.builtin.wait_for:
+        timeout: 180
+
+    - name: Install kubernetes Python library
+      ansible.builtin.pip:
+        name: kubernetes
+        state: present
+
+    - name: Create /root/.kube
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+
+    - name: Copy Kubeconfig to home directory
+      ansible.builtin.command:
+        cmd: cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+
+    - name: Clone AWX Operator repository
+      ansible.builtin.git:
+        repo: 'https://github.com/ansible/awx-operator.git'
+        dest: '/root/awx-operator'
+        version: "tags/{{ awx_operator_version }}"
+        force: yes
+
+    - name: Create Kubernetes namespace for AWX
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ awx_namespace }}"
+
+    - name: Create kustomization directory
+      ansible.builtin.file:
+        path: "{{ bastion_install_dir }}/kustomization"
+        state: directory
+
+    - name: Create kustomization.yaml file
+      ansible.builtin.copy:
+        dest: "{{ bastion_install_dir }}/kustomization/kustomization.yaml"
+        content: |
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - github.com/ansible/awx-operator/config/default?ref={{ awx_operator_version }}
+          images:
+            - name: quay.io/ansible/awx-operator
+              newTag: {{ awx_operator_version }}
+          namespace: {{ awx_namespace }}
+
+    - name: Apply AWX Operator CRDs
+      ansible.builtin.command:
+        cmd: kubectl apply -k .
+      args:
+        chdir: "{{ bastion_install_dir }}/kustomization"
+
+    - name: Allow AWX CRDs to properly deploy, wait 30s
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - name: Create awx.yml file
+      ansible.builtin.copy:
+        dest: "{{ bastion_install_dir }}/kustomization/awx.yml"
+        content: |
+          apiVersion: awx.ansible.com/v1beta1
+          kind: AWX
+          metadata:
+            name: awx
+          spec:
+            service_type: nodeport
+
+    - name: Update kustomization.yaml to include awx.yml
+      ansible.builtin.lineinfile:
+        path: "{{ bastion_install_dir }}/kustomization/kustomization.yaml"
+        line: "  - awx.yml"
+        insertafter: "resources:"
+
+    - name: Deploy AWX instance
+      ansible.builtin.command:
+        cmd: kubectl apply -k .
+      args:
+        chdir: "{{ bastion_install_dir }}/kustomization"
+
+    - name: Wait for AWX instance to be ready
+      ansible.builtin.shell: |
+        until kubectl get pods -n "{{ awx_namespace }}" -l app.kubernetes.io/name=awx-web -o jsonpath='{.items[*].status.phase}' | grep -q 'Running'; do
+          echo "Waiting for AWX instance to be ready...";
+          sleep 30;
+        done
+      register: awx_instance_ready
+      retries: 25
+      delay: 30
+      until: awx_instance_ready is success
+
+    - name: Retrieve AWX admin password
+      ansible.builtin.shell: |
+        kubectl get secret awx-admin-password -n "{{ awx_namespace }}" -o jsonpath="{.data.password}" | base64 -d
+      register: awx_admin_password
+      changed_when: false
+
+    - name: Retrieve AWX service NodePort
+      ansible.builtin.shell: |
+        kubectl get service awx-service -n "{{ awx_namespace }}" -o jsonpath="{.spec.ports[0].nodePort}"
+      register: awx_service_port
+      changed_when: false
+
+    - name: Save AWX access details to file
+      ansible.builtin.copy:
+        dest: "/tmp/awx_access_details.txt"
+        content: |
+          AWX Admin Password: {{ awx_admin_password.stdout }}
+          AWX URL: http://{{ ansible_default_ipv4.address }}:{{ awx_service_port.stdout }}
+        mode: '0644'
+
+    - name: Debug content to be saved to file
+      debug:
+        msg: |
+          AWX Admin Password: {{ awx_admin_password.stdout }}
+          AWX URL: http://{{ ansible_default_ipv4.address }}:{{ awx_service_port.stdout }}
+
+- name: Prepare awx_servers
+  hosts: awx_servers
+  become: true
+  tasks:
+    - name: Install kubernetes Python library
+      ansible.builtin.pip:
+        name: ansible-builder
+        state: present
+
+    - name: Create /root/lab
+      ansible.builtin.file:
+        path: /root/lab
+        state: directory
+
+## Place files in root lab
+
+## Cleanup root?
+## https://developers.redhat.com/articles/2023/05/08/how-create-execution-environments-using-ansible-builder#installing_the_execution_environment_builder
+...
